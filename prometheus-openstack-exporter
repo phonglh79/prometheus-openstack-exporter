@@ -2,10 +2,11 @@
 """
 OpenStack exporter for the prometheus monitoring system
 
-Copyright (C) 2016 Canonical, Ltd.
+Copyright (C) 2016-2019 Canonical, Ltd.
 Authors:
   Jacek Nykis <jacek.nykis@canonical.com>
   Laurent Sesques <laurent.sesques@canonical.com>
+  Paul Collins <paul.collins@canonical.com>
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License version 3,
@@ -43,9 +44,15 @@ from SocketServer import ForkingMixIn
 from prometheus_client import CollectorRegistry, generate_latest, Gauge, CONTENT_TYPE_LATEST
 from netaddr import IPRange
 
+import random
+import swift.common.utils
+
+from swift.common.ring.ring import Ring
+
 import logging
 import logging.handlers
 
+config = None
 log = logging.getLogger('poe-logger')
 
 
@@ -155,7 +162,7 @@ class DataGatherer(Thread):
         info['subnets'] = neutron.list_subnets()['subnets']
         return info
 
-    def _get_nova_info(self, nova, cinder):
+    def _get_nova_info(self, nova, cinder, prodstack):
         info = {}
         info['hypervisors'] = [x._info for x in nova.hypervisors.list()]
         info['services'] = [x._info for x in nova.services.list()]
@@ -168,14 +175,14 @@ class DataGatherer(Thread):
             search_opts = {'all_tenants': '1', 'limit': '100', 'marker': marker}
             new_instances = [x._info for x in nova.servers.list(search_opts=search_opts)]
             if new_instances:
-                marker = new_instances[-1]['id']
+                search_opts['marker'] = new_instances[-1]['id']
                 info['instances'].extend(new_instances)
             else:
                 break
 
         info['volume_quotas'] = {}
         info['nova_quotas'] = {}
-        for t in info['tenants']:
+        for t in prodstack['tenants']:
             tid = t['id']
             if self.use_nova_volumes:
                 info['volume_quotas'][tid] = cinder.quotas.get(tid, usage=True)._info
@@ -184,6 +191,7 @@ class DataGatherer(Thread):
                 info['nova_quotas'][tid] = nova.quotas.get(tid, detail=True)._info
             except Exception:
                 info['nova_quotas'][tid] = nova.quotas.get(tid)._info
+        return info
 
     def run(self):
         log.debug("Starting data gather thread")
@@ -195,7 +203,7 @@ class DataGatherer(Thread):
 
                 prodstack.update(self._get_keystone_info(keystone))
                 prodstack.update(self._get_neutron_info(neutron))
-                prodstack.update(self._get_nova_info(nova, cinder))
+                prodstack.update(self._get_nova_info(nova, cinder, prodstack))
 
             except Exception:
                 # Ignore failures, we will try again after refresh_interval.
@@ -614,8 +622,98 @@ class Swift():
         return generate_latest(self.registry)
 
 
+class SwiftAccountUsage():
+    def __init__(self):
+        self.registry = CollectorRegistry()
+
+        self.hash_path_prefix = config.get('hash_path_prefix', None)
+        if self.hash_path_prefix:
+            swift.common.utils.HASH_PATH_PREFIX = self.hash_path_prefix
+        self.hash_path_suffix = config.get('hash_path_suffix', None)
+        if self.hash_path_suffix:
+            swift.common.utils.HASH_PATH_SUFFIX = self.hash_path_suffix
+
+        self.reseller_prefix = config['reseller_prefix']
+        self.ring_path = config['ring_path']
+
+        try:
+            self.account_ring = self._get_account_ring()
+        except SystemExit:
+            # Most likely raised by swift.common.utils.validate_configuration().
+            raise Exception(
+                "Is swift.conf readable or at least one hash path variable configured?")
+
+    def _read_keystone_tenants_map(self, map_path):
+        m = {}
+        with open(map_path) as km:
+            line = km.readline()
+            while line != '':
+                name, id = line.strip().split()
+                m[name] = id
+                line = km.readline()
+
+        return m
+
+    def _get_account_ring(self):
+        """Read the account ring from the configured location, and return it."""
+        return Ring(
+            serialized_path=self.ring_path,
+            ring_name='account',
+            )
+
+    def _get_account_usage(self, account):
+        partition, nodes = self.account_ring.get_nodes(account=account)
+        node = random.choice(nodes)
+        account_url = 'http://{ip}:{port}/{device}/{partition}/{account}'.format(
+            account=account,
+            partition=partition,
+            **node)
+        response = requests.head(account_url)
+        if response.status_code == 204:
+            return int(response.headers['X-Account-Bytes-Used'])
+        else:
+            return 0
+
+    def gen_account_stats(self):
+        self.keystone_tenants_map = self._read_keystone_tenants_map(
+            config['keystone_tenants_map'])
+        labels = ['cloud', 'swift_account', 'tenant']
+        swift_account = Gauge(
+            'swift_account_bytes_used', 'Swift account usage in bytes', labels, registry=self.registry)
+
+        for tenant_name, tenant_id in self.keystone_tenants_map.iteritems():
+            account = self.reseller_prefix + tenant_id
+            bytes_used = self._get_account_usage(account)
+
+            swift_account.labels(config['cloud'], account, tenant_name).set(bytes_used)
+
+    def get_stats(self):
+        self.gen_account_stats()
+        return generate_latest(self.registry)
+
+
 class ForkingHTTPServer(ForkingMixIn, HTTPServer):
     pass
+
+
+# This could perhaps be cleverer, but surely not simpler.
+COLLECTORS = {
+    'cinder': Cinder,
+    'neutron': Neutron,
+    'nova': Nova,
+    'swift': Swift,
+    'swift-account-usage': SwiftAccountUsage,
+    }
+
+DATA_GATHERER_USERS = [
+    'cinder',
+    'neutron',
+    'nova',
+    ]
+
+
+def data_gatherer_needed(config):
+    return set(config['enabled_collectors']).intersection(DATA_GATHERER_USERS)
 
 
 class OpenstackExporterHandler(BaseHTTPRequestHandler):
@@ -626,16 +724,14 @@ class OpenstackExporterHandler(BaseHTTPRequestHandler):
         url = urlparse.urlparse(self.path)
         if url.path == '/metrics':
             try:
-                neutron = Neutron()
-                nova = Nova()
-                cinder = Cinder()
-                swift = Swift()
+                collectors = [COLLECTORS[collector]() for collector in config['enabled_collectors']]
                 log.debug("Collecting stats..")
-                output = neutron.get_stats() + \
-                    nova.get_stats() + \
-                    cinder.get_stats() + \
-                    swift.get_stats() + \
-                    data_gatherer.get_stats()
+                output = ''
+                for collector in collectors:
+                    output += collector.get_stats()
+                if data_gatherer:
+                    output += data_gatherer.get_stats()
+
                 self.send_response(200)
                 self.send_header('Content-Type', CONTENT_TYPE_LATEST)
                 self.end_headers()
@@ -679,7 +775,9 @@ if __name__ == '__main__':
     else:
         log.addHandler(logging.StreamHandler())
     config = yaml.safe_load(args.config_file.read())
-    data_gatherer = DataGatherer()
-    data_gatherer.start()
+    data_gatherer = None
+    if data_gatherer_needed(config):
+        data_gatherer = DataGatherer()
+        data_gatherer.start()
     server = ForkingHTTPServer(('', config.get('listen_port')), handler)
     server.serve_forever()
