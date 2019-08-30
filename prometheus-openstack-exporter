@@ -175,7 +175,7 @@ class DataGatherer(Thread):
             search_opts = {'all_tenants': '1', 'limit': '100', 'marker': marker}
             new_instances = [x._info for x in nova.servers.list(search_opts=search_opts)]
             if new_instances:
-                search_opts['marker'] = new_instances[-1]['id']
+                marker = new_instances[-1]['id']
                 info['instances'].extend(new_instances)
             else:
                 break
@@ -253,7 +253,8 @@ class Neutron():
         owner = "network:router_gateway"
         for port in self.ports:
             if port["device_id"] == uuid and port["device_owner"] == owner:
-                return port["fixed_ips"][0]["ip_address"]
+                if port["status"] == "ACTIVE" and port["fixed_ips"]:
+                    return port["fixed_ips"][0]["ip_address"]
 
     def get_floating_ips(self):
         ips = {}
@@ -633,8 +634,8 @@ class SwiftAccountUsage():
         if self.hash_path_suffix:
             swift.common.utils.HASH_PATH_SUFFIX = self.hash_path_suffix
 
-        self.reseller_prefix = config['reseller_prefix']
-        self.ring_path = config['ring_path']
+        self.reseller_prefix = config.get('reseller_prefix', 'AUTH_')
+        self.ring_path = config.get('ring_path', '/etc/swift')
 
         try:
             self.account_ring = self._get_account_ring()
@@ -644,6 +645,9 @@ class SwiftAccountUsage():
                 "Is swift.conf readable or at least one hash path variable configured?")
 
     def _read_keystone_tenants_map(self, map_path):
+        if not map_path:
+            return {}
+
         m = {}
         with open(map_path) as km:
             line = km.readline()
@@ -676,7 +680,7 @@ class SwiftAccountUsage():
 
     def gen_account_stats(self):
         self.keystone_tenants_map = self._read_keystone_tenants_map(
-            config['keystone_tenants_map'])
+            config.get('keystone_tenants_map', None))
         labels = ['cloud', 'swift_account', 'tenant']
         swift_account = Gauge(
             'swift_account_bytes_used', 'Swift account usage in bytes', labels, registry=self.registry)
@@ -712,8 +716,17 @@ DATA_GATHERER_USERS = [
     ]
 
 
+def get_collectors(collectors):
+    # For backwards compatibility and when enabled_collectors isn't defined,
+    # specify default set of collectors before commit 662b70f and f27cda8.
+    # https://github.com/CanonicalLtd/prometheus-openstack-exporter/issues/80
+    if not collectors:
+        return ['cinder', 'swift', 'nova', 'neutron']
+    return collectors
+
+
 def data_gatherer_needed(config):
-    return set(config['enabled_collectors']).intersection(DATA_GATHERER_USERS)
+    return set(get_collectors(config.get('enabled_collectors'))).intersection(DATA_GATHERER_USERS)
 
 
 class OpenstackExporterHandler(BaseHTTPRequestHandler):
@@ -724,7 +737,7 @@ class OpenstackExporterHandler(BaseHTTPRequestHandler):
         url = urlparse.urlparse(self.path)
         if url.path == '/metrics':
             try:
-                collectors = [COLLECTORS[collector]() for collector in config['enabled_collectors']]
+                collectors = [COLLECTORS[collector]() for collector in get_collectors(config.get('enabled_collectors'))]
                 log.debug("Collecting stats..")
                 output = ''
                 for collector in collectors:
@@ -775,6 +788,10 @@ if __name__ == '__main__':
     else:
         log.addHandler(logging.StreamHandler())
     config = yaml.safe_load(args.config_file.read())
+    numeric_log_level = getattr(logging, config.get('log_level').upper(), None)
+    if not isinstance(numeric_log_level, int):
+        raise ValueError('Invalid log level: %s' % config.get('log_level'))
+    log.setLevel(numeric_log_level) 
     data_gatherer = None
     if data_gatherer_needed(config):
         data_gatherer = DataGatherer()
